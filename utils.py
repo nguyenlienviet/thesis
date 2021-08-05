@@ -3,10 +3,12 @@ import pandas as pd
 import numpy as np
 from statsmodels.stats.multitest import multipletests
 from igraph import Graph, plot
+from collections import defaultdict
+import itertools
+from scipy.stats import spearmanr
+
 
 def run_sparcc(df, outdir, force=False):
-    os.makedirs(outdir, exist_ok=True)
-
     raw_path = os.path.join(outdir, 'raw.tsv')
     cor_path = os.path.join(outdir, 'cor.tsv')
     cov_path = os.path.join(outdir, 'cov.tsv')
@@ -60,24 +62,155 @@ def run_sparcc(df, outdir, force=False):
     df_pval = pd.read_csv(pval_path, sep='\t', index_col='#OTU ID')
     return df_cor, df_pval
 
-def correct_pvals(df_pval):
+def correct_pvals(df_pval, alpha=.05):
     flatten = flatten_square_df(df_pval, k=1)
-    reject, pvals_corrected, _, _ = multipletests(flatten, alpha=.99,
+    reject, pvals_corrected, _, _ = multipletests(flatten, alpha=alpha,
                                                   method='fdr_bh')
-    return reject, pvals_corrected
+    return flatten[reject].max() if sum(reject) > 0 else 0
+
+def correct_alpha(pvals, alpha=.05):
+    reject, pvals_corrected, _, _ = multipletests(pvals, alpha=alpha,
+                                                  method='fdr_bh')
+    return pvals[reject].max() if sum(reject) > 0 else 0
 
 def flatten_square_df(df, k=1):
     upper_triangle = df.where(np.triu(np.ones(df.shape), k=k).astype(np.bool))
     melted =  upper_triangle.stack()
     return melted
 
-def build_graph(df_cor, df_pvalue):
-    filt = (df_pvalue.values < 0.05) & (np.abs(df_cor.values) > 0)
-    adjmatrix = np.where(filt, df_cor.values, 0)
-    g = Graph.Weighted_Adjacency(adjmatrix, mode='UNDIRECTED')
-    g.vs['label'] = df_cor.index
-    g.vs.select(_degree=0).delete()
-    return g
+def subset_by_season(df, meta, season):
+    samples = meta['Sample_Names'][meta['Season'] == season]
+    df = df[samples]
+    df = df[df.sum(axis=1) > 0]
+    return df
+
+def filter_by_abundance(df, min_abundance):
+    df_relative = df / df.sum()
+    return df[(df_relative >= min_abundance).any(axis=1)]
+
+def filter_by_prevalence(df, min_prevalance):
+    return df[(df > 0).sum(axis=1) >= min_prevalance]
+
+def get_supernode_to_members(member_to_supernode):
+    supernode_to_members = defaultdict(set)
+    for member, supernode in member_to_supernode.items():
+        supernode_to_members[supernode].add(member)
+    return supernode_to_members
+
+def find_valid_grouping(G, supernode_to_members, level):
+    togroup = set()
+    for supernode, members in supernode_to_members.items():
+        if len(supernode) < level:
+            continue
+        group = True
+        for m1, m2 in itertools.combinations(members, 2):
+            if m1 in G and m2 in G:
+                try:
+                    if G[m1][m2]['weight'] < 0:
+                        group = False
+                        break
+                except KeyError:
+                    pass
+                for neighbor, edge1 in G[m1].items():
+                    try:
+                        edge2 = G[m2][neighbor]
+                        if np.sign(edge1['weight']) != np.sign(edge2['weight']):
+                            group = False
+                            break
+                    except KeyError:
+                        pass
+                if not group:
+                    break
+        if group:
+            togroup.add(supernode)
+    return togroup
+
+def merge_nodes(G, nodes, new_node):
+    if len(nodes) == 1:
+        return
+    G.add_node(new_node)
+    
+    for node in nodes:
+        for neighbor, edge in G[node].items():
+            if neighbor in nodes or neighbor in G[new_node]:
+                continue
+            weights = []
+            for node in nodes:
+                if neighbor in G[node]:
+                    weights.append(G[node][neighbor]['weight'])
+            G.add_edge(new_node, neighbor, weight=np.mean(weights))
+
+    # G.nodes[new_node]['abundance'] = np.mean([G.nodes[n]['abundance'] for n in nodes])
+    # G.nodes[new_node]['taxonomy'] = G.nodes[nodes[0]]['taxonomy']
+    
+    G.nodes[new_node]['OTUs'] = 0
+    for n in nodes:
+        # G.nodes[new_node]['taxonomy'] = G.nodes[n]['taxonomy']
+        G.nodes[new_node]['OTUs'] += G.nodes[n]['OTUs']
+        G.remove_node(n)
+
+def get_member_to_supernode(G, level):
+    member_to_supernode = dict()
+    for node in G:
+        member_to_supernode[node] = node[:level]
+    return member_to_supernode
+
+def merge_nodes_to_level(G, from_level, to_level):
+    print(f'Original #nodes: {len(G)}')
+    for level in range (from_level, to_level-1, -1):
+        member_to_supernode = get_member_to_supernode(G, level)
+        supernode_to_members = get_supernode_to_members(member_to_supernode)
+        togroup = find_valid_grouping(G, supernode_to_members, level)
+        for supernode in togroup:
+            merge_nodes(G, supernode_to_members[supernode], supernode)
+        print(f'Level {level} #nodes: {len(G)}')
+
+def add_node_attrs(G, level, df_filtered_relative, OTU_to_tax):
+    for node, attrs in G.nodes.items():
+        attrs['taxonomy'] = '; '.join(node[:min(len(node), level)])
+        if node[-1].startswith('denovo'):
+            attrs['abundance'] = df_filtered_relative.loc[node[-1]].mean()
+        else:
+            OTUs = [OTU for OTU, tax in OTU_to_tax.items() if len(tax) >= len(node) and tax[:len(node)] == node]
+            attrs['abundance'] = df_filtered_relative.loc[OTUs].mean().mean()
+
+def add_edge_attrs(G):
+    for edge, attrs in G.edges.items():
+        attrs['absweight'] = abs(attrs['weight'])
+        attrs['color'] = 'green' if attrs['weight'] > 0 else 'red'
+
+def calc_spearman_cor(df_OTU, env_var):
+    nonnan_samples = env_var.index[env_var.notna()]
+    df_OTU = df_OTU.loc[:, nonnan_samples]
+    env_var = env_var[nonnan_samples]
+    
+    env_cor_pval = df_OTU.apply(lambda row: spearmanr(row, env_var), axis=1, result_type='expand')
+    env_cor = env_cor_pval[0]
+    env_pval = env_cor_pval[1]
+    threshold = correct_alpha(env_pval)
+    env_cor.loc[env_cor[env_pval > threshold].index] = 0
+    env_cor.name = env_var.name
+    return env_cor
+
+def add_env_node(G, env_cor, OTU_to_tax):
+    node_name = env_cor.name
+    G.add_node(node_name)
+    for n in list(G):
+        try:
+            n = tuple(n.split('; '))
+        except AttributeError:
+            pass
+        if n[-1].startswith('denovo'):
+            weight = env_cor[n[-1]]
+        else:
+            weights = []
+            for OTU, tax in OTU_to_tax.items():
+                if len(tax) >= len(n) and tax[:len(n)] == n:
+                    weights.append(env_cor[OTU])
+            weight = np.mean(weights)
+        if weight != 0 and not np.isnan(weight):
+            G.add_edge(node_name, '; '.join(n), weight=weight, color='red' if weight < 0 else 'green', absweight=abs(weight))
+            pass
 
 def graph_stats(g):
     print(f'# edges: {len(g.es)}')
@@ -87,13 +220,3 @@ def graph_stats(g):
     print(f'min degree: {np.min(g.degree())}')
     print(f'median degree: {np.median(g.degree())}')
     print(f'transitivity: {g.transitivity_undirected()}')
-
-def plot_graph(g):
-    g.es.select(weight_lt=0)['color'] = 'red'
-    g.es.select(weight_gt=0)['color'] = 'green'
-    g.vs.select(cluster_eq=0.0)['color'] = 'gray'
-    g.vs.select(cluster_eq=1.0)['color'] = 'black'
-    labels = g.vs['label']
-    g.vs['label'] = None
-    p = plot(g, layout=g.layout('kk'))
-    return p, labels
